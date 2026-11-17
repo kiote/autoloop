@@ -531,7 +531,7 @@ function setConfigOverride(
   options.configOverride = config.put(options.configOverride, key, value);
 }
 
-function parseConfigAssignment(
+export function parseConfigAssignment(
   assignment: string,
 ): { key: string; value: string } | null {
   const eq = assignment.indexOf("=");

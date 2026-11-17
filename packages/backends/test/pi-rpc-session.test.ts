@@ -20,6 +20,7 @@ interface MockChild extends ChildProcess {
   sent: Record<string, unknown>[];
   pushLine: (msg: Record<string, unknown> | string) => void;
   autoRespond: boolean;
+  autoSettle: boolean;
   failCommands: Set<string>;
   responseData: Record<string, unknown>;
 }
@@ -35,10 +36,20 @@ vi.mock("node:child_process", () => {
     child.sent = [];
     child.autoRespond = (globalThis as any).__piAutoRespond ?? true;
     child.failCommands = new Set();
+    child.autoSettle = true;
     child.responseData = {};
     child.pushLine = (msg) => {
       const line = typeof msg === "string" ? msg : JSON.stringify(msg);
       (child.stdout as any).push(`${line}\n`);
+      if (
+        typeof msg !== "string" &&
+        msg.type === "agent_end" &&
+        child.autoSettle
+      ) {
+        (child.stdout as any).push(
+          `${JSON.stringify({ type: "agent_settled", aborted: false })}\n`,
+        );
+      }
     };
     child.stdin = new Writable({
       write(chunk: Buffer, _e: unknown, cb: () => void) {
@@ -207,7 +218,115 @@ describe("initPiSession", () => {
 });
 
 describe("sendPiPrompt", () => {
-  it("accumulates streamed text deltas until agent_end", async () => {
+  it("waits through retryable agent_end until the recovered run settles", async () => {
+    const session = await startSession();
+    lastChild.autoSettle = false;
+    let completed = false;
+    const pending = sendPiPrompt(session, "recover", 5000).then((result) => {
+      completed = true;
+      return result;
+    });
+    await settle();
+    lastChild.pushLine({
+      type: "message_update",
+      assistantMessageEvent: { type: "error", reason: "terminated" },
+    });
+    lastChild.pushLine({
+      type: "agent_end",
+      willRetry: true,
+      messages: [
+        { role: "assistant", stopReason: "error", errorMessage: "terminated" },
+      ],
+    });
+    lastChild.pushLine({ type: "auto_retry_start", attempt: 1 });
+    await settle();
+    expect(completed).toBe(false);
+    lastChild.pushLine({ type: "agent_start" });
+    lastChild.pushLine({
+      type: "message_end",
+      message: { role: "assistant", stopReason: "stop" },
+    });
+    lastChild.pushLine({
+      type: "agent_end",
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "recovered" }] },
+      ],
+    });
+    await settle();
+    expect(completed).toBe(false);
+    lastChild.pushLine({ type: "agent_settled", aborted: false });
+    expect(await pending).toEqual({ output: "recovered", timedOut: false });
+    expect(session.agentEndWaiters).toHaveLength(0);
+  });
+
+  it("waits for queued follow-up work even when willRetry is false", async () => {
+    const session = await startSession();
+    lastChild.autoSettle = false;
+    const pending = sendPiPrompt(session, "follow-up", 5000);
+    await settle();
+    lastChild.pushLine({ type: "agent_end", willRetry: false, messages: [] });
+    lastChild.pushLine({ type: "agent_start" });
+    lastChild.pushLine({
+      type: "agent_end",
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "final" }] },
+      ],
+    });
+    lastChild.pushLine({ type: "agent_settled", aborted: false });
+    expect(await pending).toEqual({ output: "final", timedOut: false });
+  });
+
+  it("keeps final failure and abort distinct from successful recovery", async () => {
+    const session = await startSession();
+    lastChild.autoSettle = false;
+    const failed = sendPiPrompt(session, "exhaust retries", 5000);
+    await settle();
+    lastChild.pushLine({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "unavailable",
+      },
+    });
+    lastChild.pushLine({ type: "agent_end", messages: [] });
+    lastChild.pushLine({ type: "agent_settled", aborted: false });
+    expect((await failed).error).toBe("unavailable");
+    const aborted = sendPiPrompt(session, "abort", 5000);
+    await settle();
+    lastChild.pushLine({ type: "agent_settled", aborted: true });
+    expect((await aborted).error).toBe("pi run aborted");
+  });
+
+  it("fails closed if Pi settles without a low-level result", async () => {
+    const session = await startSession();
+    const pending = sendPiPrompt(session, "missing result", 5000);
+    await settle();
+    lastChild.pushLine({ type: "agent_settled", aborted: false });
+    expect((await pending).error).toBe("pi settled without a final agent_end");
+  });
+
+  it("times out without settlement and removes the abandoned waiter", async () => {
+    const session = await startSession();
+    lastChild.autoSettle = false;
+    const pending = sendPiPrompt(session, "not settled", 30);
+    await settle();
+    lastChild.pushLine({ type: "agent_end", messages: [] });
+    expect((await pending).timedOut).toBe(true);
+    expect(session.agentEndWaiters).toHaveLength(0);
+  });
+
+  it("returns immediately when a prompt was handled without starting a run", async () => {
+    const session = await startSession();
+    lastChild.responseData.prompt = { disposition: "handled" };
+    expect(await sendPiPrompt(session, "/command", 5000)).toEqual({
+      output: "",
+      timedOut: false,
+    });
+    expect(session.agentEndWaiters).toHaveLength(0);
+  });
+
+  it("accumulates streamed text deltas until agent_settled", async () => {
     const session = await startSession();
     const pending = sendPiPrompt(session, "do the thing", 5000);
     await settle();
@@ -422,6 +541,7 @@ describe("RPC framing", () => {
     stdout.push(':{"type":"text_delta","delta":"split"}}\r\n');
     stdout.push("not json at all\n");
     stdout.push('{"type":"agent_end","messages":[]}\n');
+    stdout.push('{"type":"agent_settled","aborted":false}\n');
 
     const result = await pending;
     expect(result.output).toBe("split");

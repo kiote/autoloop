@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import * as config from "@mobrienv/autoloop-core/config";
 import { findRunByPrefix } from "@mobrienv/autoloop-core/registry/read";
 import type { RunRecord } from "@mobrienv/autoloop-core/registry/types";
 import * as harness from "@mobrienv/autoloop-harness";
@@ -6,12 +7,13 @@ import { cliPrintEvent } from "../cli/event-printer.js";
 import { teeEvents } from "../cli/events-sink.js";
 import { EXIT_ENV, EXIT_USAGE, fail } from "../cli/fail.js";
 import { herdrEventSink } from "../cli/herdr-sink.js";
-import { backendOverrideSpec } from "./run.js";
+import { backendOverrideSpec, parseConfigAssignment } from "./run.js";
 
 interface ResumeArgs {
   runId: string | null;
   addIterations?: number;
   backendOverride?: Record<string, unknown>;
+  configOverride: Record<string, unknown>;
   logLevel: string | null;
   usageError: boolean;
   /** Force every fan-out stage branch to relaunch rather than resume. */
@@ -95,6 +97,7 @@ export async function dispatchResume(
       addIterations: parsed.addIterations,
       selfCommand: selfCmd,
       backendOverride: parsed.backendOverride,
+      configOverride: parsed.configOverride,
       logLevel: parsed.logLevel,
       baseStateDir: stateDir,
       signal: abort.signal,
@@ -142,6 +145,7 @@ function validateResumable(
 function parseResumeArgs(args: string[]): ResumeArgs {
   const out: ResumeArgs = {
     runId: null,
+    configOverride: {},
     logLevel: null,
     usageError: false,
   };
@@ -183,6 +187,27 @@ function parseResumeArgs(args: string[]): ResumeArgs {
         return out;
       }
       out.backendOverride = backendOverrideSpec(backend);
+      i += 2;
+      continue;
+    }
+    if (token === "--set") {
+      const assignment = args[i + 1];
+      const parsed = assignment ? parseConfigAssignment(assignment) : null;
+      if (!parsed) {
+        fail(
+          assignment
+            ? `invalid --set assignment: ${assignment}`
+            : "missing key=value after --set",
+          EXIT_USAGE,
+        );
+        out.usageError = true;
+        return out;
+      }
+      out.configOverride = config.put(
+        out.configOverride,
+        parsed.key,
+        parsed.value,
+      );
       i += 2;
       continue;
     }
@@ -232,6 +257,12 @@ export function printResumeUsage(): void {
   );
   console.log(
     "                        reusing journaled branch results from a prior attempt",
+  );
+  console.log(
+    "  --set key=value       Override a config key for this resume; repeatable",
+  );
+  console.log(
+    "                        Example: --set event_loop.max_iteration_runtime=2h",
   );
   console.log("  -v, --verbose         Set log level to debug");
   console.log("  -h, --help            Show this help");

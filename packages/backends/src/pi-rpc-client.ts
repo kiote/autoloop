@@ -51,6 +51,8 @@ export interface PiSession {
   textBuffer: string;
   stderrBuffer: string;
   lastError: string;
+  /** Latest low-level result; completion requires agent_settled. */
+  lastAgentEnd?: PiRpcMessage;
   /** Resolves when the child process exits — used to race against hanging prompts */
   closed: Promise<{ code: number | null; signal: string | null }>;
   nextRequestId: number;
@@ -212,7 +214,9 @@ export async function initPiSession(opts: PiClientOptions): Promise<PiSession> {
 /**
  * Send one autoloop iteration prompt and wait for the agent to finish.
  * Output is the accumulated assistant text (streaming deltas, with the
- * agent_end message list as fallback). On timeout the in-flight turn is
+ * final agent_end message list as fallback), completed by agent_settled.
+ * Low-level run boundaries may be followed by retries or queued work.
+ * On timeout the in-flight turn is
  * aborted via the RPC `abort` command and partial output is returned.
  */
 export async function sendPiPrompt(
@@ -222,6 +226,7 @@ export async function sendPiPrompt(
 ): Promise<PiPromptResult> {
   session.textBuffer = "";
   session.lastError = "";
+  session.lastAgentEnd = undefined;
   session.streamLines = [];
 
   let timedOut = false;
@@ -252,6 +257,11 @@ export async function sendPiPrompt(
         error: ack.error || "pi rejected prompt",
       };
     }
+    const data = ack.data as { disposition?: string } | undefined;
+    if (data?.disposition === "handled") {
+      clearTimeout(timer);
+      return { output: "", timedOut: false };
+    }
     const end = await Promise.race([agentEnd, timeoutPromise, crashPromise]);
     clearTimeout(timer);
     return finishPrompt(session, end);
@@ -259,7 +269,7 @@ export async function sendPiPrompt(
     clearTimeout(timer);
     if (timedOut) {
       abortPiTurn(session);
-      // Bounded grace: let the aborted turn drain (agent_end) so the next
+      // Bounded grace: let the aborted turn drain (agent_settled) so the next
       // new_session lands on an idle agent instead of a streaming one.
       await Promise.race([
         agentEnd,
@@ -270,6 +280,8 @@ export async function sendPiPrompt(
     }
     return { output: session.textBuffer, timedOut: false, error: String(err) };
   } finally {
+    // One prompt is active at a time; discard waiters on rejection/crash too.
+    session.agentEndWaiters = [];
     flushStreamLog(session);
   }
 }
@@ -295,6 +307,7 @@ export async function resetPiSession(session: PiSession): Promise<void> {
   }
   session.textBuffer = "";
   session.lastError = "";
+  session.lastAgentEnd = undefined;
   session.toolCalls.clear();
 }
 
@@ -424,7 +437,9 @@ function waitForAgentEnd(session: PiSession): Promise<PiRpcMessage> {
 
 function finishPrompt(session: PiSession, end: PiRpcMessage): PiPromptResult {
   const output = session.textBuffer || agentEndText(end);
-  const error = session.lastError || stopReasonError(end);
+  const error = end.aborted
+    ? "pi run aborted"
+    : session.lastError || stopReasonError(end);
   if (error) return { output, timedOut: false, error };
   return { output, timedOut: false };
 }
@@ -469,11 +484,27 @@ function handlePiLine(session: PiSession, line: string): void {
   }
   trackPiToolCall(session, msg);
 
+  // agent_end is a low-level boundary. Pi can still retry, compact or run
+  // follow-up work; only agent_settled guarantees session-level completion.
+  if (msg.type === "agent_start") session.lastError = "";
+  const message = msg.message as { role?: string } | undefined;
+  if (msg.type === "message_end" && message?.role === "assistant") {
+    session.lastError = stopReasonError({ messages: [message] });
+  }
   if (msg.type === "agent_end") {
     session.toolCalls.clear();
+    session.lastAgentEnd = msg;
+  }
+  if (msg.type === "agent_settled") {
+    const end = session.lastAgentEnd ?? { messages: [] };
+    if (!session.lastAgentEnd && !msg.aborted) {
+      session.lastError = "pi settled without a final agent_end";
+    }
     const waiters = session.agentEndWaiters;
     session.agentEndWaiters = [];
-    for (const waiter of waiters) waiter(msg);
+    for (const waiter of waiters) {
+      waiter({ ...end, aborted: msg.aborted === true });
+    }
   }
 }
 

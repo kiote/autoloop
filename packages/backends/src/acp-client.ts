@@ -123,10 +123,21 @@ export async function initAcpSession(
   // Build transport: manual NDJSON parsing on stdout (more reliable), SDK serialization on stdin
   const stdin = child.stdin;
   const stdout = child.stdout;
+  // Node emits a stream error as well as invoking the write callback. During
+  // shutdown, cancellation can race the child's exit and produce EPIPE.
+  // Retain the error for future writes without turning cleanup into an
+  // unhandled process-level exception.
+  let stdinError: Error | undefined;
+  stdin.on("error", (error: Error) => {
+    stdinError = error;
+  });
 
   const writable = new WritableStream<Uint8Array>({
     async write(chunk) {
-      if (stdin.destroyed || stdin.writableEnded) return;
+      if (stdinError) throw stdinError;
+      if (stdin.destroyed || stdin.writableEnded) {
+        throw new Error("ACP stdin is not writable");
+      }
       return new Promise<void>((resolve, reject) => {
         stdin.write(chunk, (err) => (err ? reject(err) : resolve()));
       });
@@ -341,7 +352,11 @@ async function sendAcpPromptOnce(
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
-      session.connection.cancel({ sessionId: session.sessionId });
+      void Promise.resolve(
+        session.connection.cancel({ sessionId: session.sessionId }),
+      ).catch(() => {
+        /* cancellation can race transport shutdown */
+      });
       reject(new Error("ACP prompt timed out"));
     }, timeoutMs);
   });
@@ -401,7 +416,11 @@ export async function terminateAcpSession(session: AcpSession): Promise<void> {
 
   // Cancel any in-flight turn before killing
   try {
-    session.connection.cancel({ sessionId: session.sessionId });
+    void Promise.resolve(
+      session.connection.cancel({ sessionId: session.sessionId }),
+    ).catch(() => {
+      /* cancellation can race transport shutdown */
+    });
   } catch {
     /* may not have a session */
   }

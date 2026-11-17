@@ -71,6 +71,37 @@ autoloop run . "Fix the login bug" -b pi
 autoloop run . --chain autocode,autoqa "Implement the approved change and validate it"
 ```
 
+### `resume`
+
+Continue an existing stopped or failed run without discarding its journal,
+memory, working files, or worktree.
+
+```bash
+autoloop resume <run-id> [--add-iterations N] [-b backend] [--set key=value] [-v]
+```
+
+`--set` uses the same assignment syntax as `run` and is repeatable. Overrides
+apply to this resumed process, including configuration reloads; they do not
+edit the preset or user configuration. Repeat them on a later resume if needed.
+The last assignment to a key wins. The additive iteration budget remains
+controlled by `--add-iterations`, not `--set event_loop.max_iterations=...`.
+
+For long verification steps:
+
+```bash
+autoloop resume my-run -b pi --add-iterations 50 \
+  --set backend.timeout_ms=7200000 \
+  --set event_loop.max_iteration_runtime=2h
+```
+
+`event_loop.max_iteration_runtime`, when configured, overrides the base backend
+timeout. Role-specific limits and the whole-loop runtime budget still apply.
+
+The Pi RPC backend waits for `agent_settled` rather than the intermediate
+`agent_end` event. This allows Pi's own automatic retries and queued work to
+finish without converting a recoverable stream interruption into a run failure.
+Use a Pi version that emits `agent_settled` (verified with Pi 1.5.0).
+
 ### `emit`
 
 Publish a coordination event to the journal.

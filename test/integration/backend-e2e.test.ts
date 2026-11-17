@@ -15,7 +15,7 @@ import {
   PRESET_FIXTURE_DIR,
   ROOT,
   readText,
-  runCli,
+  runCli as runUncheckedCli,
 } from "../helpers/runtime.js";
 
 beforeAll(() => {
@@ -56,6 +56,14 @@ function runBinCli(
     stderr: res.stderr || "",
     status: res.status,
   };
+}
+
+function runCli(
+  ...args: Parameters<typeof runUncheckedCli>
+): ReturnType<typeof runUncheckedCli> {
+  const result = runUncheckedCli(...args);
+  expect(result.status, result.stderr || result.stdout).toBe(0);
+  return result;
 }
 
 function makeBackendProject(name: string, backendToml: string[]): string {
@@ -122,13 +130,28 @@ process.stdin.on("data", (chunk) => {
         process.exit(8);
       }
       out({ type: "response", id: cmd.id, command: "prompt", success: true });
-      const text = "pi backend handled the iteration. LOOP_COMPLETE";
-      out({ type: "agent_start" });
-      out({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: text } });
-      out({
-        type: "agent_end",
-        messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] }],
-      });
+      const complete = () => {
+        const text = "pi backend handled the iteration. LOOP_COMPLETE";
+        out({ type: "agent_start" });
+        out({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: text } });
+        out({ type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+        out({
+          type: "agent_end",
+          messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] }],
+        });
+        out({ type: "agent_settled", aborted: false });
+      };
+      if (cmd.message.includes("transient pi e2e")) {
+        out({ type: "agent_start" });
+        out({
+          type: "agent_end", willRetry: true,
+          messages: [{ role: "assistant", stopReason: "error", errorMessage: "terminated" }],
+        });
+        out({ type: "auto_retry_start", attempt: 1, delayMs: 50 });
+        setTimeout(complete, 50);
+      } else {
+        complete();
+      }
     } else if (cmd.type === "get_session_stats") {
       out({
         type: "response", id: cmd.id, command: cmd.type, success: true,
@@ -145,7 +168,10 @@ process.stdin.on("data", (chunk) => {
 });
 `;
 
-  it("completes a loop through a live pi RPC session", () => {
+  it.each([
+    "normal",
+    "transient",
+  ])("completes a loop through a live pi RPC session: %s", (scenario) => {
     const bin = mkdtempSync(join(tmpdir(), "autoloop-fake-pi-"));
     const fakePiScript = writeExecutable(bin, "fake-pi.cjs", FAKE_PI);
     const piPath = wrapNodeScript(bin, "pi", fakePiScript);
@@ -155,7 +181,7 @@ process.stdin.on("data", (chunk) => {
       `backend.command = ${JSON.stringify(piPath)}`,
       "backend.timeout_ms = 30000",
     ]);
-    const res = runBinCli(["run", project, "pi e2e"], project);
+    const res = runBinCli(["run", project, `${scenario} pi e2e`], project);
 
     expect(res.status).toBe(0);
     const journal = expectLoopCompleted(project);
@@ -172,6 +198,10 @@ process.stdin.on("data", (chunk) => {
       join(project, ".autoloop/runs", runId, "pi-stream.1.jsonl"),
     );
     expect(streamLog).toContain('"type":"agent_end"');
+    expect(streamLog).toContain('"type":"agent_settled"');
+    if (scenario === "transient") {
+      expect(streamLog).toContain('"type":"auto_retry_start"');
+    }
   }, 30_000);
 });
 

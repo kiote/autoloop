@@ -108,6 +108,53 @@ describe("dispatchResume", () => {
     expect(process.exitCode ?? 0).toBe(0);
   });
 
+  it("forwards repeatable resume configuration overrides without changing files", async () => {
+    writeRegistry([baseRecord()]);
+    await dispatchResume([
+      "run-aaaa",
+      "--set",
+      "backend.timeout_ms=7200000",
+      "--set",
+      "event_loop.max_iteration_runtime=2h",
+      "--set",
+      "backend.timeout_ms=8000000",
+    ]);
+    expect(resumeSpy).toHaveBeenCalledTimes(1);
+    const [, options] = resumeSpy.mock.calls[0] as [
+      RunRecord,
+      Record<string, unknown>,
+    ];
+    expect(options.configOverride).toEqual({
+      backend: { timeout_ms: "8000000" },
+      event_loop: { max_iteration_runtime: "2h" },
+    });
+  });
+
+  it.each([
+    undefined,
+    "bad",
+    "=value",
+    "key=",
+    " = ",
+  ])("refuses malformed or missing --set assignments: %j", async (assignment) => {
+    writeRegistry([baseRecord()]);
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      await dispatchResume([
+        "run-aaaa",
+        "--set",
+        ...(assignment === undefined ? [] : [assignment]),
+      ]);
+      expect(resumeSpy).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(1);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("--set"));
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it("resolves a run by prefix", async () => {
     writeRegistry([baseRecord()]);
     await dispatchResume(["run-a"]);
